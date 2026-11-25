@@ -1,0 +1,89 @@
+# 镜像仓库使用说明（README）
+
+> **安全铁律：本仓库必须始终保持 private。** 它包含上游 `__UPSTREAM_REPO__` 的源代码，
+> 一旦改为 public 即等于源码外泄。**严禁**把本仓库设为 public、fork 到公开位置或转发
+> 其内容。
+
+本仓库是上游仓库 [`__UPSTREAM_REPO__`](https://github.com/__UPSTREAM_REPO__) 中
+**`__TARGET_DIR__` 目录**的只读镜像，根目录即该子目录内容。
+
+- 上游仓库：`__UPSTREAM_REPO__`（分支 `__UPSTREAM_BRANCH__`）
+- 镜像目录：`__TARGET_DIR__`
+- 镜像仓库：`__MIRROR_REPO__`（必须 private）
+
+## 重要规则
+
+1. **保持 private**：本仓库含上游源码，绝不可公开。
+2. **`main` 是只读镜像**：每天定时任务会把 `main` 强制重置为上游最新内容，
+   **不要直接在 `main` 上开发或提交**。
+3. **上游无感**：本仓库的 workflow 与说明文件不会同步回上游，上游不会感知镜像的存在。
+4. **真正的合并发生在上游**：你的改动最终经 PR 合入上游 `__TARGET_DIR__`，
+   再由定时任务单向带回本仓库 `main`。
+
+## 日常开发流程
+
+```bash
+# 1. 从最新的 main 开功能分支
+git fetch origin main
+git switch -c my-feature origin/main
+
+# 2. 开发、提交
+git add -A
+git commit -m "feat: ..."
+
+# 3. 推到本仓库
+git push -u origin my-feature
+
+# 4. 在 GitHub 上开 PR（base = main）
+```
+
+## 一键把镜像 PR 同步到上游（推荐）
+
+合并你的镜像 PR（或直接对其分支）后，在仓库 **Actions** 页面手动运行
+**`Sync a mirror PR to upstream branch`** workflow：
+
+- `pr_number`：本仓库的 PR 号（必填）
+- `target_branch`：上游目标分支名（留空 = 自动 `pr-<PR号>-<短SHA>`）
+
+workflow 会：
+
+1. 计算该 PR 相对 `main` 的净改动（排除镜像专用文件）；
+2. 以子目录前缀 `__TARGET_DIR__/` 套用到上游；
+3. 推送到上游的一个**新分支**（不改上游 `__UPSTREAM_BRANCH__`）；
+4. 在运行摘要里给出开 PR 的 compare 链接。
+
+> 冲突时会报错停止，不会静默覆盖上游代码。此时请把功能分支 rebase 到最新
+> `main` 后重跑。
+
+## 前置配置（一次性）
+
+在上游推送上需要写权限，请在 **仓库 Settings → Secrets and variables → Actions**
+配置：
+
+- `UPSTREAM_TOKEN`：一个有 `__UPSTREAM_REPO__` 写权限的 Personal Access Token
+  （fine-grained PAT，权限 `contents: read/write`）。
+
+> 若上游已公开且只需读取，同步 `main` 本身不需要该 token；它只用于
+> “同步 PR 到上游”这一步。
+
+## 手动流程（备选，不使用 workflow 时）
+
+```bash
+# 在本仓库功能分支上开发并提交后：
+git format-patch origin/main --stdout > /tmp/mirror.patch
+
+# 到上游的本地克隆上：
+git switch -c my-feature origin/__UPSTREAM_BRANCH__
+git apply --directory=__TARGET_DIR__ /tmp/mirror.patch
+git add -A __TARGET_DIR__
+git commit -m "feat: ..."
+git push origin my-feature
+```
+
+## 故障排查
+
+- **定时同步失败 / No space left on device**：workflow 已内置“清理预装 SDK”
+  步骤；若上游进一步变大，可再删更多预装组件。
+- **workflow 消失**：请勿手动删除 `main` 上的 `.github/workflows/`；同步任务
+  会在 force 推送前自动保留这些文件。
+- **`git apply` 冲突**：上游 `__TARGET_DIR__` 已有不兼容改动，先 rebase 再试。

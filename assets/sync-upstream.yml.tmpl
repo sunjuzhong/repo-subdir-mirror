@@ -1,0 +1,74 @@
+name: Sync upstream subdirectory
+
+# 定时把上游 __UPSTREAM_REPO__ 的 __TARGET_DIR__ 目录同步到本仓库根目录。
+# main 会被 --force 硬重置为上游最新内容，只保留本仓库自有文件（workflows、SUBTREE_PR.md）。
+on:
+  schedule:
+    - cron: '__CRON__'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free up disk space
+        run: |
+          set -euo pipefail
+          echo "Disk before:"; df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo apt-get clean
+          echo "Disk after:"; df -h /
+
+      - name: Install git-filter-repo
+        run: pip install git-filter-repo
+
+      - name: Clone and filter upstream subdirectory
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/__UPSTREAM_REPO__.git"
+          if [ -n "${UPSTREAM_TOKEN:-}" ]; then
+            URL="https://x-access-token:${UPSTREAM_TOKEN}@github.com/__UPSTREAM_REPO__.git"
+          fi
+          git clone --branch "__UPSTREAM_BRANCH__" --single-branch "$URL" /tmp/upstream
+          cd /tmp/upstream
+          git filter-repo --path "__TARGET_DIR__" --path-rename "__TARGET_DIR__/": --force
+
+      - name: Push filtered history to this mirror repo
+        run: |
+          set -euo pipefail
+          cd /tmp/upstream
+          git remote add dest "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          # 镜像专用文件：上游子目录里没有它们，但 main 上必须保留，
+          # 否则下面的 --force 推送会把本 workflow 和说明文档一并删除。
+          git fetch dest main || true
+          MIRROR_ONLY_FILES=(
+            '.github/workflows/sync-upstream.yml'
+            '.github/workflows/sync-pr-to-upstream.yml'
+            'SUBTREE_PR.md'
+          )
+          for f in "${MIRROR_ONLY_FILES[@]}"; do
+            git restore --source=dest/main -- "$f" 2>/dev/null || true
+          done
+
+          git add -A
+          if ! git diff --cached --quiet; then
+            git -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                -c user.name="github-actions[bot]" \
+                commit -m "ci: preserve mirror-only files (workflows, SUBTREE_PR.md)"
+          fi
+
+          git push dest "HEAD:main" --force
