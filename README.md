@@ -62,7 +62,7 @@
 
 - `./.github/workflows/mirror-*.yml`——改写后的**草稿**（自动把子目录前缀剥离为镜像根、
   把自托管 runner 换成 `ubuntu-latest`）。
-- `MIRROR_CI_NOTES.md`——**人工确认清单**：逐条列出已自动改写（FIX）与必须人工处理
+- `MIRROR_CI_NOTES.md`——**人工确认清单**（写到仓库根目录）：逐条列出已自动改写（FIX）与必须人工处理
   （WARN：指向子目录之外的路径、`uses: ./...` 本地复用 workflow、私有 npm registry、
   secret、OIDC 等）的地方。
 
@@ -109,4 +109,7 @@ repo-subdir-mirror/
   `ls-remote` 取远端 SHA 做 `--force-with-lease` **就地更新**，同一个上游 PR 自动刷新、不新建分支。
 - **force 前保留镜像专用文件**：否则日同步会把 workflow 自己和说明文档删掉（自毁）；
   搬进来的 `mirror-*` 前缀 CI workflow 也会被自动保留。
+- **空结果不覆盖**：过滤后若没有任何文件（上游子目录被改名/删除或参数写错），同步直接
+  报错退出，不会把镜像 `main` 清空。
+- **只推新分支**：回馈上游时拒绝推送到上游主分支，`target_branch` 留空即按 PR 号命名。
 - **稀疏克隆**：`--filter=blob:none --sparse --depth 1` 只取目标子目录，节省磁盘与时间。

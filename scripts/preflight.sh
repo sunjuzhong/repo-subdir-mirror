@@ -40,7 +40,11 @@ bad()  { printf '  [FAIL] %s\n' "$1"; fail=1; }
 echo "== 环境检查 =="
 command -v git >/dev/null 2>&1 && ok "git 已安装（$(git --version)）" || bad "缺少 git"
 command -v gh  >/dev/null 2>&1 && ok "gh 已安装（$(gh --version | head -1)）" || bad "缺少 gh（https://cli.github.com）"
-command -v python3 >/dev/null 2>&1 && ok "python3 已安装" || warn "缺少 python3（仅本地渲染模板需要）"
+command -v python3 >/dev/null 2>&1 && ok "python3 已安装" || warn "缺少 python3（scripts/mirror-ci.sh 改写 CI 时需要；setup/preflight 本身不依赖）"
+
+# 统一去掉误加的首尾斜杠，避免渲染出的 __TARGET_DIR__/ 变成双斜杠。
+TARGET_DIR="${TARGET_DIR#/}"
+TARGET_DIR="${TARGET_DIR%/}"
 
 echo
 echo "== 参数校验 =="
@@ -48,7 +52,11 @@ echo "== 参数校验 =="
 [[ -n "$TARGET_DIR"    ]] && ok "target-dir    = $TARGET_DIR"    || bad "缺少 --target-dir"
 [[ -n "$MIRROR_REPO"   ]] && ok "mirror-repo   = $MIRROR_REPO"   || bad "缺少 --mirror-repo"
 ok "upstream-branch = $UPSTREAM_BRANCH"
-ok "cron            = $CRON"
+if [[ "$(printf '%s' "$CRON" | awk '{print NF}')" -eq 5 ]]; then
+  ok "cron            = $CRON"
+else
+  bad "cron 必须是 5 段（分 时 日 月 周，UTC），当前：'$CRON'"
+fi
 if [[ "$MIRROR_REPO" == "$UPSTREAM_REPO" ]]; then
   bad "mirror-repo 不能等于 upstream-repo（镜像必须是你自己的仓库）"
 fi

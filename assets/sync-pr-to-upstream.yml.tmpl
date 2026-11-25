@@ -6,7 +6,7 @@ name: Sync a mirror PR to upstream branch
 # - 保留逐条 commit（不压成一个），作者信息也保留。
 # - 分支名默认 mirror-pr-<PR号>：对同一 PR 重跑会“就地更新”该分支（force-with-lease），
 #   因此已经开好的上游 PR 会自动刷新，不会新建分支。
-# - 只会推送到上游的这个分支，不会改上游 __UPSTREAM_BRANCH__，之后由你去开/更新 PR。
+# - 只会推送到上游的这个新分支，绝不会改上游 __UPSTREAM_BRANCH__，之后由你去开/更新 PR。
 on:
   workflow_dispatch:
     inputs:
@@ -39,7 +39,8 @@ jobs:
       - name: Checkout mirror repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # 需要完整历史：format-patch 要沿提交链逐个生成补丁。
+          fetch-depth: 0
 
       - name: Free up disk space
         run: |
@@ -53,6 +54,29 @@ jobs:
           sudo apt-get clean
           echo "Disk after:"; df -h /
 
+      - name: Validate inputs
+        env:
+          PR_INPUT: ${{ inputs.pr_number }}
+          BRANCH_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          case "${PR_INPUT}" in
+            ''|*[!0-9]*)
+              echo "::error::pr_number 必须是数字（镜像仓库的 PR 号），收到：'${PR_INPUT}'"
+              exit 1 ;;
+          esac
+          BRANCH="${BRANCH_INPUT:-mirror-pr-${PR_INPUT}}"
+          if [ "${BRANCH}" = "${UPSTREAM_BRANCH}" ]; then
+            echo "::error::拒绝推送到上游 ${UPSTREAM_BRANCH}：本 workflow 只允许推送到新分支。"
+            exit 1
+          fi
+          if ! git check-ref-format "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            echo "::error::上游分支名不合法：'${BRANCH}'"
+            exit 1
+          fi
+          echo "TARGET_BRANCH=${BRANCH}" >> "$GITHUB_ENV"
+          echo "将把 PR #${PR_INPUT} 的提交逐条推送到 ${UPSTREAM_REPO}:${BRANCH}"
+
       - name: Build per-commit patches from the mirror PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -60,7 +84,11 @@ jobs:
         run: |
           set -euo pipefail
           TITLE=$(gh pr view "$PR" --repo "${{ github.repository }}" --json title --jq .title)
-          echo "PR_TITLE=$TITLE" >> "$GITHUB_ENV"
+          {
+            echo "PR_TITLE<<EOF"
+            echo "$TITLE"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
           # 拉取镜像 main 与 PR head 两个 ref。
           git fetch --no-tags origin \
@@ -77,7 +105,7 @@ jobs:
             ':(exclude).github/workflows/sync-pr-to-upstream.yml' \
             ':(exclude).github/workflows/mirror-*'
 
-          COUNT=$(ls -1 /tmp/patches/*.patch 2>/dev/null | wc -l | tr -d ' ')
+          COUNT=$(find /tmp/patches -maxdepth 1 -name '*.patch' | wc -l | tr -d ' ')
           echo "PATCH_COUNT=${COUNT}" >> "$GITHUB_ENV"
           if [ "${COUNT}" -eq 0 ]; then
             echo "::error::PR #${PR} 相对 ${MIRROR_BRANCH} 没有可同步的改动（补丁为空）。"
@@ -88,14 +116,10 @@ jobs:
       - name: Apply to upstream subdirectory and push a branch
         env:
           UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+          PR: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
-          PR="${{ inputs.pr_number }}"
-          BRANCH="${{ inputs.target_branch }}"
-          if [ -z "$BRANCH" ]; then
-            # 固定按 PR 号命名：同一 PR 重跑就是更新同一个分支，上游 PR 会随之刷新。
-            BRANCH="mirror-pr-${PR}"
-          fi
+          BRANCH="${TARGET_BRANCH}"
 
           if [ -z "${UPSTREAM_TOKEN:-}" ]; then
             echo "::error::未配置 UPSTREAM_TOKEN secret，无法推送到上游。"
@@ -109,13 +133,15 @@ jobs:
           git sparse-checkout set "${PREFIX}"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
+
+          # 单分支浅克隆里本地只有 UPSTREAM_BRANCH 一个分支，不会与目标分支重名。
           git switch -c "${BRANCH}"
 
           # 逐条套用补丁：--directory 给所有路径加上子目录前缀，把镜像根树铺回上游子目录。
           # --3way 在轻微错位时尝试三方合并；仍失败则中止，绝不静默覆盖上游。
           if ! git am --3way --directory="${PREFIX}" /tmp/patches/*.patch; then
             git am --abort || true
-            echo "::error::补丁无法应用到上游 ${PREFIX}。上游可能已变更，请先 rebase 你的镜像分支后重试。"
+            echo "::error::补丁无法应用到上游 ${PREFIX}。上游可能已变更（或该 PR 已被合并），请先把镜像分支 rebase 到最新 ${MIRROR_BRANCH} 后重试。"
             exit 1
           fi
 

@@ -43,7 +43,8 @@ git push -u origin my-feature
 **`Sync a mirror PR to upstream branch`** workflow：
 
 - `pr_number`：本仓库的 PR 号（必填）
-- `target_branch`：上游目标分支名（留空 = `mirror-pr-<PR号>`）
+- `target_branch`：上游目标分支名（留空 = `mirror-pr-<PR号>`；不能填上游主分支
+  `__UPSTREAM_BRANCH__`，填了会被拒绝，分支名不合法也会被拦下）
 
 workflow 会：
 
@@ -82,15 +83,16 @@ OIDC 等）需要你手动处理。
 
 ```bash
 # 在本仓库功能分支上开发并提交后：
-git format-patch origin/main --stdout > /tmp/mirror.patch
+git format-patch origin/main -o /tmp/mirror-patches
 
-# 到上游的本地克隆上：
+# 到上游的本地克隆上（保留逐条提交与作者）：
 git switch -c my-feature origin/__UPSTREAM_BRANCH__
-git apply --directory=__TARGET_DIR__ /tmp/mirror.patch
-git add -A __TARGET_DIR__
-git commit -m "feat: ..."
+git am --3way --directory=__TARGET_DIR__ /tmp/mirror-patches/*.patch
 git push origin my-feature
 ```
+
+> 只想压成一个提交时，改用 `git format-patch origin/main --stdout > /tmp/mirror.patch`，
+> 再 `git apply --directory=__TARGET_DIR__ /tmp/mirror.patch` 后自行 commit。
 
 ## 故障排查
 

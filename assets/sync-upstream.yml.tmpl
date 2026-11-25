@@ -50,6 +50,15 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/upstream
+
+          # 安全阀：过滤后必须还有上游子目录的内容。若子目录被改名/删除或参数写错，
+          # filter-repo 会生成一个空仓库；此时继续 force 推送会把镜像 main 整个清空。
+          if ! git rev-parse --verify -q HEAD >/dev/null \
+             || [ -z "$(git ls-tree -r --name-only HEAD | head -n 1)" ]; then
+            echo "::error::过滤结果为空：上游 __UPSTREAM_REPO__ 的 __UPSTREAM_BRANCH__ 分支下找不到 __TARGET_DIR__ 的内容。已中止，未改动镜像 main。"
+            exit 1
+          fi
+
           git remote add dest "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
 
           # 镜像专用文件：上游子目录里没有它们，但 main 上必须保留，
@@ -61,10 +70,13 @@ jobs:
             'SUBTREE_PR.md'
           )
           # 由 mirror-ci 从上游搬进来的 CI workflow（命名以 mirror- 前缀）也要保留，
-          # 否则每天同步后它们会消失。用 ls-tree 动态发现，无需逐个登记。
+          # 否则每天同步后它们会消失。动态发现，无需逐个登记。
+          # 注意：git ls-tree 的 pathspec 不支持通配符，必须取目录再按前缀过滤。
           while IFS= read -r f; do
-            [ -n "$f" ] && MIRROR_ONLY_FILES+=("$f")
-          done < <(git ls-tree --name-only dest/main -- '.github/workflows/mirror-*' 2>/dev/null || true)
+            case "$f" in
+              .github/workflows/mirror-*) MIRROR_ONLY_FILES+=("$f") ;;
+            esac
+          done < <(git ls-tree -r --name-only dest/main -- '.github/workflows' 2>/dev/null || true)
           for f in "${MIRROR_ONLY_FILES[@]}"; do
             git restore --source=dest/main -- "$f" 2>/dev/null || true
           done

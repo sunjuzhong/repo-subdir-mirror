@@ -24,8 +24,10 @@ workflow 把某个镜像 PR 的改动套用到上游子目录并推成上游的�
 2. **上游全程只读**。任何自动化都不得向上游写入、开 PR 或推送。
 3. **推上游只能由人工手动触发**：本 skill 只生成 workflow；实际触发由用户在自己仓库
    的 Actions 页面手动执行，agent 不要代为触发写上游的 workflow。
-4. **不要把用户的业务流程相关文件带到上游**：镜像专用文件
-   （`.github/workflows/*`、`SUBTREE_PR.md`）在回馈上游时必须被排除，让上游无感。
+4. **不要把用户的业务流程相关文件带到上游**：本 skill 生成的镜像专用文件
+   （两个 `sync-*.yml`、`mirror-*` CI 草稿、`SUBTREE_PR.md`）在回馈上游时必须被排除，
+   让上游无感。你在镜像里另外新建的其它 workflow 不在排除清单内，会随补丁落到
+   `target-dir/.github/workflows/` 下（对上游通常无害，但请自行判断）。
 5. 所有 workflow / secret 只放用户的镜像仓库，绝不放到上游。
 6. token 不明文打印、不写入文件。
 
@@ -100,13 +102,15 @@ scripts/setup.sh \
 scripts/mirror-ci.sh \
   --upstream-repo <owner/repo> --target-dir <sub/dir> \
   --workflow .github/workflows/<该子目录的CI>.yaml \
-  [--workflow ...] [--out-dir ./.github/workflows] [--account <name>] [--print]
+  [--workflow ...] [--out-dir ./.github/workflows] [--prefix mirror-] [--account <name>] [--print]
 ```
 
-它**只读上游**，产出 `./.github/workflows/mirror-*.yml`（草稿）与 `MIRROR_CI_NOTES.md`
-（人工确认清单）。机械改写：子目录前缀 → 镜像根、自托管 runner → `ubuntu-latest`；
-无法机械处理的部分（指向子目录之外的路径、`uses: ./...` 本地复用 workflow、私有 npm
-registry、secret、OIDC、多 job 依赖等）全部列进清单。
+它**只读上游**，产出 `./.github/workflows/mirror-*.yml`（草稿）与镜像仓库根目录的
+`MIRROR_CI_NOTES.md`（人工确认清单；有 git 仓库时写到仓库根）。机械改写：子目录前缀 →
+镜像根、自托管 runner → `ubuntu-latest`；无法机械处理的部分（指向子目录之外的路径、
+`uses: ./...` 本地复用 workflow、私有 npm registry、secret、OIDC、多 job 依赖等）全部列进清单。
+拉取阶段只要有一个 workflow 读不到就直接退出，不会留下半套草稿；本机装有 PyYAML 时
+还会对改写结果做一次 YAML 语法自检（不合法只记 WARN）。
 
 **必须做的事**：把清单里的 FIX/WARN/INFO 原样呈现给用户，让他逐条确认后再提交。
 这是 best-effort，产物是草稿，**不要**声称“已完全等价于上游 CI”。草稿以 `mirror-`
@@ -122,6 +126,9 @@ registry、secret、OIDC、多 job 依赖等）全部列进清单。
   `git am` 到上游，推送到上游分支 `mirror-pr-<PR号>`，并给出开 PR 的 compare 链接。
   冲突会报错停止，不会静默覆盖上游。**同一 PR 重复运行会就地刷新同名分支**
   （`--force-with-lease`），已开的上游 PR 自动更新、不新建分支。
+  `target_branch` 不能填上游主分支（填了会直接拒绝），分支名不合法也会被拦下。
+- 若某天上游把 `target-dir` 改名/删除，同步任务会在 force 推送前发现“过滤结果为空”
+  并**报错退出**，不会把镜像 `main` 清空。
 
 ## 生成物说明（本 skill 的 assets）
 
@@ -152,8 +159,13 @@ registry、secret、OIDC、多 job 依赖等）全部列进清单。
   `git restore --source=dest/main` 把 `.github/workflows/*` 和 `SUBTREE_PR.md` 带回来
   （模板已含此步骤，勿删）。
 - **`git filter-repo` 报路径错误**：`--path-rename` 目标为根目录写 `dir/:`，不要写 `dir/:/`。
-- **`git am` 冲突**：上游子目录已有不兼容改动；让用户把镜像分支 rebase 到最新 `main` 后重试。
-  模板捕获失败后会 `git am --abort` 并报错停止，不会留下半套改动。
+- **`git am` 冲突**：上游子目录已有不兼容改动（或该 PR 已被合并）；让用户把镜像分支
+  rebase 到最新 `main` 后重试。模板捕获失败后会 `git am --abort` 并报错停止，不会留下半套改动。
+- **日同步报“过滤结果为空”**：上游把 `target-dir` 改名/删除，或参数写错。同步会中止、
+  镜像 `main` 保持原状；确认新路径后用新参数重新渲染 workflow（重跑 `setup.sh`）即可。
+- **保留了 `mirror-*` 却不见了**：`git ls-tree` 的 pathspec **不支持通配符**，模板因此
+  先取 `.github/workflows` 目录再按 `mirror-` 前缀过滤；若你自行改过这一步，注意别写回
+  `git ls-tree ... -- '.github/workflows/mirror-*'`（会静默匹配不到）。
 - **搬进来的 CI workflow 消失了**：日同步只保留文件名以 `mirror-` 前缀的 workflow；
   用 `mirror-ci.sh` 产出的草稿天然带此前缀。若你手动改名去掉了前缀，请加回或加入保留清单。
 - **PR 补丁为空 / 重跑后上游 PR 未更新**：补丁为空说明 PR 相对 `main` 无净改动（改动须在

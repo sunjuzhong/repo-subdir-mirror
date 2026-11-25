@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
     --prefix)        PREFIX="${2:-}"; shift 2 ;;
     --account)       ACCOUNT="${2:-}"; shift 2 ;;
     --print)         PRINT=1; shift ;;
-    -h|--help)       sed -n '3,22p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '3,21p' "$0"; exit 0 ;;
     *) die "未知参数：$1" ;;
   esac
 done
@@ -48,6 +48,11 @@ done
 [[ -n "$UPSTREAM_REPO" ]] || die "缺少 --upstream-repo"
 [[ -n "$TARGET_DIR" ]]    || die "缺少 --target-dir"
 [[ ${#WORKFLOWS[@]} -gt 0 ]] || die "至少需要一个 --workflow"
+
+# 允许用户误写的首尾斜杠：target-dir 统一去掉。
+TARGET_DIR="${TARGET_DIR#/}"
+TARGET_DIR="${TARGET_DIR%/}"
+[[ -n "$TARGET_DIR" ]] || die "--target-dir 不能为空或仅是斜杠"
 
 command -v gh >/dev/null 2>&1 || die "未找到 gh（GitHub CLI）"
 command -v python3 >/dev/null 2>&1 || die "未找到 python3"
@@ -59,8 +64,13 @@ if [[ -n "$ACCOUNT" ]]; then
   export GH_TOKEN="$TOK"
 fi
 
-REPORT="$(mktemp)"
+# 临时区：失败/退出时一并清理，不在磁盘上留半套产物。
+STAGE="$(mktemp -d)"
+REPORT="$STAGE/report.md"
+cleanup() { rm -rf "$STAGE"; }
+trap cleanup EXIT
 : > "$REPORT"
+
 {
   echo "# 搬入的 CI workflow —— 人工确认清单"
   echo
@@ -71,12 +81,31 @@ REPORT="$(mktemp)"
   echo
 } >> "$REPORT"
 
+# ---- 第一阶段：先把所有 workflow 拉下来 ----
+# 任何一个拉取失败就直接退出，避免只写出“半套”草稿。
+SRC_FILES=()
+WF_PATHS=()
 for WF in "${WORKFLOWS[@]}"; do
+  WF="${WF#./}"
+  WF="${WF#/}"
+  [[ -n "$WF" ]] || die "--workflow 不能为空"
   echo "== 拉取上游 ${WF} =="
-  TMP="$(mktemp)"
-  gh api "repos/${UPSTREAM_REPO}/contents/${WF}" \
-    -H "Accept: application/vnd.github.raw" > "$TMP" \
-    || die "读取上游 ${WF} 失败（路径是否正确？账号是否有权限？）"
+  SRC="$STAGE/src-$(( ${#SRC_FILES[@]} + 1 )).yaml"
+  if ! gh api "repos/${UPSTREAM_REPO}/contents/${WF}" \
+         -H "Accept: application/vnd.github.raw" > "$SRC"; then
+    die "读取上游 ${WF} 失败（路径是否正确？账号是否有权限？）"
+  fi
+  [[ -s "$SRC" ]] || die "上游 ${WF} 内容为空（是不是目录或文件不存在？）"
+  SRC_FILES+=("$SRC")
+  WF_PATHS+=("$WF")
+done
+
+# ---- 第二阶段：改写并落盘 ----
+idx=0
+while [[ "$idx" -lt "${#SRC_FILES[@]}" ]]; do
+  SRC="${SRC_FILES[$idx]}"
+  WF="${WF_PATHS[$idx]}"
+  idx=$(( idx + 1 ))
 
   BASE="$(basename "$WF")"
   BASE="${BASE%.*}.yml"
@@ -103,6 +132,9 @@ def runner_sub(m):
     fixes.append(f"runs-on: `{val}` -> `ubuntu-latest`")
     return f"{indent}ubuntu-latest"
 text = re.sub(r'^([ \t]*runs-on:[ \t]*)(.+?)[ \t]*$', runner_sub, text, flags=re.M)
+for lst in re.findall(r'^[ \t]*runs-on:[ \t]*\[(.*?)\]', text, re.M):
+    if 'self-hosted' in lst:
+        warns.append(f"`runs-on: [{lst}]` 是列表形式且含自托管 runner，无法机械改写，请人工改为 `ubuntu-latest`。")
 
 # ---- 2) working-directory 指向子目录 -> . ----
 def wd_sub(m):
@@ -173,6 +205,17 @@ header = (
 )
 out_text = header + text
 
+# ---- 6) 语法自检（装了 PyYAML 才做，失败只提示不阻断）----
+try:
+    import yaml
+except ImportError:
+    yaml = None
+if yaml is not None:
+    try:
+        yaml.safe_load(out_text)
+    except Exception as exc:
+        warns.append(f"改写后的内容不是合法 YAML（{type(exc).__name__}），请人工检查缩进与结构。")
+
 if out_path == "-":
     sys.stdout.write(out_text)
 else:
@@ -207,13 +250,12 @@ PY
   }
 
   if [[ "$PRINT" -eq 1 ]]; then
-    run_transform "$TMP" "-"
+    run_transform "$SRC" "-"
   else
     mkdir -p "$OUT_DIR"
-    run_transform "$TMP" "$OUT_DIR/$OUT_NAME"
+    run_transform "$SRC" "$OUT_DIR/$OUT_NAME"
     echo "    已写入 $OUT_DIR/$OUT_NAME"
   fi
-  rm -f "$TMP"
 done
 
 echo
@@ -222,9 +264,13 @@ if [[ "$PRINT" -eq 1 ]]; then
   echo "==================== 人工确认清单 ===================="
   cat "$REPORT"
 else
-  NOTES="$(dirname "$OUT_DIR")/../MIRROR_CI_NOTES.md"
+  # 清单放在仓库根目录（有 git 仓库时用 toplevel，否则当前目录）。
+  if NOTES_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    NOTES="${NOTES_ROOT}/MIRROR_CI_NOTES.md"
+  else
+    NOTES="./MIRROR_CI_NOTES.md"
+  fi
   cp "$REPORT" "$NOTES"
   echo "已写出人工确认清单：$NOTES"
   echo "请 review 后自行 git add / commit（本脚本不提交、不推送、不碰上游）。"
 fi
-rm -f "$REPORT"

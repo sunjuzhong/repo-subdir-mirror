@@ -13,10 +13,12 @@
 #     --upstream-repo your-org/big-monorepo \
 #     --target-dir    path/to/subdir \
 #     --mirror-repo   yourname/mirror-repo \
-#     [--upstream-branch main] \
+#     [--upstream-branch main] [--mirror-branch main] \
 #     [--account yourname] \
 #     [--cron "0 2 * * *"] \
 #     [--no-sync] [--yes]
+#
+# 注意：token 只通过 http.extraheader 传给 git，不写进 URL / .git/config，也不打印。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,7 +48,7 @@ while [[ $# -gt 0 ]]; do
     --visibility) die "镜像仓库必须为 private，不接受 --visibility（防止源码外泄）" ;;
     --no-sync) RUN_SYNC=0; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
-    -h|--help) sed -n '11,19p' "$0"; exit 0 ;;
+    -h|--help) sed -n '11,21p' "$0"; exit 0 ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
   esac
 done
@@ -54,6 +56,10 @@ done
 [[ -n "$UPSTREAM_REPO" ]] || die "缺少 --upstream-repo"
 [[ -n "$TARGET_DIR"    ]] || die "缺少 --target-dir"
 [[ -n "$MIRROR_REPO"   ]] || die "缺少 --mirror-repo"
+# 统一去掉用户可能误加的首尾斜杠（模板里 __TARGET_DIR__/ 的写法依赖它没有尾斜杠）。
+TARGET_DIR="${TARGET_DIR#/}"
+TARGET_DIR="${TARGET_DIR%/}"
+[[ -n "$TARGET_DIR" ]] || die "--target-dir 不能为空或仅是斜杠"
 [[ "$MIRROR_REPO" != "$UPSTREAM_REPO" ]] || die "mirror-repo 不能等于 upstream-repo"
 [[ -d "$ASSETS_DIR" ]] || die "找不到 assets 目录：$ASSETS_DIR"
 
@@ -66,6 +72,9 @@ command -v gh >/dev/null 2>&1 || die "缺少 gh CLI"
 gh auth status >/dev/null 2>&1 || die "gh 未登录，请先运行 gh auth login"
 TOKEN="${GH_TOKEN:-$(gh auth token)}"
 [[ -n "$TOKEN" ]] || die "无法获取 gh token"
+
+# 用 http.extraheader 传凭据：token 不会出现在 URL、远程配置或输出里。
+AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')"
 
 echo "即将搭建镜像仓库："
 echo "  上游        : $UPSTREAM_REPO @ $UPSTREAM_BRANCH  →  目录 $TARGET_DIR"
@@ -108,7 +117,7 @@ else
 fi
 
 echo "[2/4] 克隆镜像仓库并渲染镜像专用文件 ..."
-git clone "https://x-access-token:${TOKEN}@github.com/${MIRROR_REPO}.git" "$WORK/repo"
+git -c http.extraheader="$AUTH_HEADER" clone "https://github.com/${MIRROR_REPO}.git" "$WORK/repo"
 cd "$WORK/repo"
 if ! git rev-parse --verify -q HEAD >/dev/null; then
   git switch -c "$MIRROR_BRANCH"   # 空仓库：建立初始分支
@@ -128,7 +137,7 @@ else
 fi
 
 echo "[3/4] 推送到 $MIRROR_REPO:$MIRROR_BRANCH ..."
-git push origin "$MIRROR_BRANCH"
+git -c http.extraheader="$AUTH_HEADER" push origin "$MIRROR_BRANCH"
 
 echo "[4/4] 触发一次同步（把上游 $TARGET_DIR 拉进 main）..."
 if [[ "$RUN_SYNC" -eq 1 ]]; then
