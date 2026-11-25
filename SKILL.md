@@ -14,6 +14,7 @@ workflow 把某个镜像 PR 的改动套用到上游子目录并推成上游的�
 - 用户只想改上游大仓库里的某一个子目录，不想克隆/检出整个大仓库。
 - 用户要一个“某子目录的每日自动镜像”。
 - 用户想把自己在镜像仓库里的改动，以 PR 形式回馈到上游。
+- 用户希望在自己镜像仓库里的 PR 也跑上游对该子目录的 CI 检查（见第 5 步，best-effort）。
 
 ## 硬约束（务必遵守）
 
@@ -90,23 +91,53 @@ scripts/setup.sh \
    仅“同步 PR 到上游”需要；日同步本身不需要。
 2. 等首次 `Sync upstream subdirectory` 跑完，即可 `git clone` 镜像仓库开始开发。
 
+### 第 5 步（可选）：把子目录的 CI 搬进镜像仓库（方案 B，best-effort）
+
+当用户抱怨“推上游 PR 时撞上原仓库 actions 失败”“镜像里跑不了上游那条 CI”时，用
+`scripts/mirror-ci.sh` 把上游对该子目录的 CI 搬到镜像里跑：
+
+```bash
+scripts/mirror-ci.sh \
+  --upstream-repo <owner/repo> --target-dir <sub/dir> \
+  --workflow .github/workflows/<该子目录的CI>.yaml \
+  [--workflow ...] [--out-dir ./.github/workflows] [--account <name>] [--print]
+```
+
+它**只读上游**，产出 `./.github/workflows/mirror-*.yml`（草稿）与 `MIRROR_CI_NOTES.md`
+（人工确认清单）。机械改写：子目录前缀 → 镜像根、自托管 runner → `ubuntu-latest`；
+无法机械处理的部分（指向子目录之外的路径、`uses: ./...` 本地复用 workflow、私有 npm
+registry、secret、OIDC、多 job 依赖等）全部列进清单。
+
+**必须做的事**：把清单里的 FIX/WARN/INFO 原样呈现给用户，让他逐条确认后再提交。
+这是 best-effort，产物是草稿，**不要**声称“已完全等价于上游 CI”。草稿以 `mirror-`
+前缀命名，日同步会自动保留（见 `sync-upstream.yml` 的 `mirror-*` 保留逻辑）。
+
 ## 日常使用（写进镜像仓库的 SUBTREE_PR.md，此处速览）
 
 - `main` 是只读镜像，每天被 force 重置 → **开发必须从 `main` 开功能分支**。
 - 真正的合并发生在上游；改动经 PR 合入上游后，由日同步单向带回镜像 `main`。
 - 回馈上游：合并镜像 PR 后，手动运行上游镜像仓库的
   `Sync a mirror PR to upstream branch` workflow，填 `pr_number`。
-  它按“两棵树直接 diff”取净改动（排除镜像专用文件），以 `target-dir/` 前缀
-  `git apply` 到上游，推送到上游**新分支**，并给出开 PR 的 compare 链接。
-  冲突会报错停止，不会静默覆盖上游。
+  它把该 PR 的**每个提交**逐条生成补丁（排除镜像专用文件），以 `target-dir/` 前缀
+  `git am` 到上游，推送到上游分支 `mirror-pr-<PR号>`，并给出开 PR 的 compare 链接。
+  冲突会报错停止，不会静默覆盖上游。**同一 PR 重复运行会就地刷新同名分支**
+  （`--force-with-lease`），已开的上游 PR 自动更新、不新建分支。
 
 ## 生成物说明（本 skill 的 assets）
 
 | 文件 | 作用 |
 |------|------|
-| `assets/sync-upstream.yml.tmpl` | 每日把上游子目录 `git filter-repo` 到镜像 `main`；force 推送前保留镜像专用文件，防止自毁 |
-| `assets/sync-pr-to-upstream.yml.tmpl` | 手动触发：把某个镜像 PR 的改动推成上游新分支 |
+| `assets/sync-upstream.yml.tmpl` | 每日把上游子目录 `git filter-repo` 到镜像 `main`；force 推送前保留镜像专用文件（含 `mirror-*`）防止自毁 |
+| `assets/sync-pr-to-upstream.yml.tmpl` | 手动触发：把某个镜像 PR 的每个提交逐条推成/更新上游分支 |
 | `assets/SUBTREE_PR.md.tmpl` | 镜像仓库里的开发/PR 操作说明 |
+
+脚本：
+
+| 文件 | 作用 |
+|------|------|
+| `scripts/preflight.sh` | 只读预检（含镜像仓库强制 private 校验） |
+| `scripts/setup.sh` | 一键搭建（强制 private） |
+| `scripts/mirror-ci.sh` | 方案 B：把子目录 CI 搬进镜像（best-effort 草稿 + 人工确认清单） |
 
 模板占位符：`__UPSTREAM_REPO__` `__UPSTREAM_BRANCH__` `__TARGET_DIR__`
 `__MIRROR_REPO__` `__MIRROR_BRANCH__` `__CRON__`，由 `setup.sh` 渲染。
@@ -121,5 +152,10 @@ scripts/setup.sh \
   `git restore --source=dest/main` 把 `.github/workflows/*` 和 `SUBTREE_PR.md` 带回来
   （模板已含此步骤，勿删）。
 - **`git filter-repo` 报路径错误**：`--path-rename` 目标为根目录写 `dir/:`，不要写 `dir/:/`。
-- **`git apply` 冲突**：上游子目录已有不兼容改动；让用户把镜像分支 rebase 到最新 `main` 后重试。
-- **PR 补丁为空**：镜像 PR 相对 `main` 无净改动（`main` 是只读镜像，改动须在功能分支上）。
+- **`git am` 冲突**：上游子目录已有不兼容改动；让用户把镜像分支 rebase 到最新 `main` 后重试。
+  模板捕获失败后会 `git am --abort` 并报错停止，不会留下半套改动。
+- **搬进来的 CI workflow 消失了**：日同步只保留文件名以 `mirror-` 前缀的 workflow；
+  用 `mirror-ci.sh` 产出的草稿天然带此前缀。若你手动改名去掉了前缀，请加回或加入保留清单。
+- **PR 补丁为空 / 重跑后上游 PR 未更新**：补丁为空说明 PR 相对 `main` 无净改动（改动须在
+  功能分支上）；重跑未更新则确认两次填写的 `target_branch` 是否一致、上游分支是否被他人改过
+  （`--force-with-lease` 会因此拒绝）。

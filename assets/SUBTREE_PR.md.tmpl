@@ -43,17 +43,29 @@ git push -u origin my-feature
 **`Sync a mirror PR to upstream branch`** workflow：
 
 - `pr_number`：本仓库的 PR 号（必填）
-- `target_branch`：上游目标分支名（留空 = 自动 `pr-<PR号>-<短SHA>`）
+- `target_branch`：上游目标分支名（留空 = `mirror-pr-<PR号>`）
 
 workflow 会：
 
-1. 计算该 PR 相对 `main` 的净改动（排除镜像专用文件）；
-2. 以子目录前缀 `__TARGET_DIR__/` 套用到上游；
-3. 推送到上游的一个**新分支**（不改上游 `__UPSTREAM_BRANCH__`）；
+1. 把该 PR 相对 `main` 的**每个提交**逐条生成补丁（排除镜像专用文件），保留提交信息与作者；
+2. 以子目录前缀 `__TARGET_DIR__/` 逐条 `git am` 套用到上游；
+3. 推送到上游的 `mirror-pr-<PR号>` 分支（不改上游 `__UPSTREAM_BRANCH__`）；
 4. 在运行摘要里给出开 PR 的 compare 链接。
 
 > 冲突时会报错停止，不会静默覆盖上游代码。此时请把功能分支 rebase 到最新
 > `main` 后重跑。
+>
+> **同一个 PR 重复运行**：目标分支名固定，第二次运行会**就地刷新**该分支
+> （`--force-with-lease`），已经开好的上游 PR 会自动更新，**不会**新建分支或 PR。
+
+## 把子目录 CI 搬进本仓库（可选）
+
+想让本仓库的 PR 也跑上游对 `__TARGET_DIR__` 的那条 CI 检查，可在本地仓库运行
+skill 的 `scripts/mirror-ci.sh`（只读上游），产出一份**草稿** workflow 与一份
+`MIRROR_CI_NOTES.md` 人工确认清单；review 后再提交。草稿以 `mirror-` 前缀命名，
+日同步会自动保留它们。注意这是 **best-effort**：上游 CI 常与 monorepo 深度耦合，
+清单里 WARN 的部分（指向子目录之外的路径、`uses: ./...`、私有 npm registry、secret、
+OIDC 等）需要你手动处理。
 
 ## 前置配置（一次性）
 

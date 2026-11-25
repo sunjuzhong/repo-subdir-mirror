@@ -1,8 +1,12 @@
 name: Sync a mirror PR to upstream branch
 
-# 手动触发：输入本镜像仓库的一个 PR 号，把该 PR 相对 main 的改动
-# 套用到上游 __UPSTREAM_REPO__ 的 __TARGET_DIR__ 目录下，推送到上游的一个新分支。
-# 只会推送到上游的“新分支”，不会改上游的 __UPSTREAM_BRANCH__，之后由你去开 PR。
+# 手动触发：输入本镜像仓库的一个 PR 号，把该 PR 相对 main 的每个提交
+# 逐条套用到上游 __UPSTREAM_REPO__ 的 __TARGET_DIR__ 目录下，推送到上游的一个分支。
+#
+# - 保留逐条 commit（不压成一个），作者信息也保留。
+# - 分支名默认 mirror-pr-<PR号>：对同一 PR 重跑会“就地更新”该分支（force-with-lease），
+#   因此已经开好的上游 PR 会自动刷新，不会新建分支。
+# - 只会推送到上游的这个分支，不会改上游 __UPSTREAM_BRANCH__，之后由你去开/更新 PR。
 on:
   workflow_dispatch:
     inputs:
@@ -11,7 +15,7 @@ on:
         required: true
         type: string
       target_branch:
-        description: "上游目标分支名（留空 = 自动 pr-<PR号>-<短SHA>）"
+        description: "上游目标分支名（留空 = mirror-pr-<PR号>；重跑会更新同一分支）"
         required: false
         type: string
 
@@ -49,7 +53,7 @@ jobs:
           sudo apt-get clean
           echo "Disk after:"; df -h /
 
-      - name: Build patch from the mirror PR
+      - name: Build per-commit patches from the mirror PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ inputs.pr_number }}
@@ -58,29 +62,28 @@ jobs:
           TITLE=$(gh pr view "$PR" --repo "${{ github.repository }}" --json title --jq .title)
           echo "PR_TITLE=$TITLE" >> "$GITHUB_ENV"
 
-          # 拉取镜像 main 与 PR head 两个 ref，按“两棵树直接 diff”得到净改动，
-          # 不依赖 merge-base（镜像 main 每天被 force 重置，历史对不上）。
+          # 拉取镜像 main 与 PR head 两个 ref。
           git fetch --no-tags origin \
             "+refs/heads/${MIRROR_BRANCH}:refs/remotes/origin/${MIRROR_BRANCH}" \
             "pull/${PR}/head:refs/remotes/origin/pr/${PR}"
 
-          SHORT_SHA=$(git rev-parse --short "refs/remotes/origin/pr/${PR}")
-          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          # 逐条生成补丁（保留每个 commit 的提交信息与作者），
+          # 排除镜像专用文件，让上游对镜像配置“无感”。
+          rm -rf /tmp/patches && mkdir -p /tmp/patches
+          git format-patch --binary "origin/${MIRROR_BRANCH}..refs/remotes/origin/pr/${PR}" \
+            -o /tmp/patches -- . \
+            ':(exclude)SUBTREE_PR.md' \
+            ':(exclude).github/workflows/sync-upstream.yml' \
+            ':(exclude).github/workflows/sync-pr-to-upstream.yml' \
+            ':(exclude).github/workflows/mirror-*'
 
-          # 排除镜像专用文件，上游不感知镜像配置。
-          EXCLUDES=(
-            ':(exclude)SUBTREE_PR.md'
-            ':(exclude).github/workflows/sync-upstream.yml'
-            ':(exclude).github/workflows/sync-pr-to-upstream.yml'
-          )
-          git diff --binary "origin/${MIRROR_BRANCH}" "refs/remotes/origin/pr/${PR}" \
-            -- . "${EXCLUDES[@]}" > /tmp/pr.patch
-
-          if [ ! -s /tmp/pr.patch ]; then
+          COUNT=$(ls -1 /tmp/patches/*.patch 2>/dev/null | wc -l | tr -d ' ')
+          echo "PATCH_COUNT=${COUNT}" >> "$GITHUB_ENV"
+          if [ "${COUNT}" -eq 0 ]; then
             echo "::error::PR #${PR} 相对 ${MIRROR_BRANCH} 没有可同步的改动（补丁为空）。"
             exit 1
           fi
-          echo "Patch size: $(wc -c < /tmp/pr.patch) bytes"
+          echo "生成了 ${COUNT} 个补丁："; ls -1 /tmp/patches
 
       - name: Apply to upstream subdirectory and push a branch
         env:
@@ -90,7 +93,8 @@ jobs:
           PR="${{ inputs.pr_number }}"
           BRANCH="${{ inputs.target_branch }}"
           if [ -z "$BRANCH" ]; then
-            BRANCH="pr-${PR}-${SHORT_SHA}"
+            # 固定按 PR 号命名：同一 PR 重跑就是更新同一个分支，上游 PR 会随之刷新。
+            BRANCH="mirror-pr-${PR}"
           fi
 
           if [ -z "${UPSTREAM_TOKEN:-}" ]; then
@@ -103,33 +107,40 @@ jobs:
             "https://x-access-token:${UPSTREAM_TOKEN}@github.com/${UPSTREAM_REPO}.git" /tmp/upstream
           cd /tmp/upstream
           git sparse-checkout set "${PREFIX}"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
           git switch -c "${BRANCH}"
 
-          # --directory 给补丁所有路径加上子目录前缀，把镜像根树铺回上游子目录。
-          if ! git apply --whitespace=nowarn --directory="${PREFIX}" /tmp/pr.patch; then
+          # 逐条套用补丁：--directory 给所有路径加上子目录前缀，把镜像根树铺回上游子目录。
+          # --3way 在轻微错位时尝试三方合并；仍失败则中止，绝不静默覆盖上游。
+          if ! git am --3way --directory="${PREFIX}" /tmp/patches/*.patch; then
+            git am --abort || true
             echo "::error::补丁无法应用到上游 ${PREFIX}。上游可能已变更，请先 rebase 你的镜像分支后重试。"
             exit 1
           fi
 
-          git add -A "${PREFIX}"
-          if git diff --cached --quiet; then
-            echo "::error::应用补丁后没有产生改动（可能与上游已一致）。"
-            exit 1
+          # 幂等推送：分支已存在时用 --force-with-lease 就地更新（期望值取当前远端 SHA，
+          # 防止覆盖别人的并发改动）；不存在时普通推送即可。
+          OLD_SHA=$(git ls-remote origin "refs/heads/${BRANCH}" | cut -f1)
+          if [ -n "${OLD_SHA}" ]; then
+            git push --force-with-lease="refs/heads/${BRANCH}:${OLD_SHA}" \
+              origin "HEAD:refs/heads/${BRANCH}"
+            ACTION="已更新（force-with-lease）"
+          else
+            git push origin "HEAD:refs/heads/${BRANCH}"
+            ACTION="已新建"
           fi
-
-          git -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              -c user.name="github-actions[bot]" \
-              commit -m "feat: ${PR_TITLE} (mirror PR #${PR})"
-
-          git push origin "${BRANCH}"
 
           COMPARE="https://github.com/${UPSTREAM_REPO}/compare/${UPSTREAM_BRANCH}...${BRANCH}?expand=1"
           {
-            echo "## 已推送到上游新分支"
+            echo "## 已${ACTION}上游分支"
             echo ""
             echo "- 上游仓库：\`${UPSTREAM_REPO}\`"
-            echo "- 新分支：\`${BRANCH}\`"
+            echo "- 分支：\`${BRANCH}\`"
             echo "- 源镜像 PR：#${PR} —— ${PR_TITLE}"
+            echo "- 搬运的提交数：${PATCH_COUNT}"
             echo ""
-            echo "去开 PR：${COMPARE}"
+            echo "去开/更新 PR：${COMPARE}"
+            echo ""
+            echo "> 对同一 PR 再次运行本 workflow，会就地刷新该分支，无需重新建 PR。"
           } >> "$GITHUB_STEP_SUMMARY"
